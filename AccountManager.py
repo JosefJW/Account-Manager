@@ -1,9 +1,12 @@
 import os
 import time
+import uuid
 from dotenv import load_dotenv
 import sqlite3
 import re
 import bcrypt
+import pyotp
+import qrcode
 import secrets
 import smtplib
 from email.mime.text import MIMEText
@@ -30,17 +33,28 @@ class AccountManager():
         is_valid_password_callback (function): Function to use when checking if a password is valid
         Default:
             def is_valid_password(self, password):
-                if len(password) < 8:
-                    return False
-                if not re.search(r'[a-z]', password):
-                    return False
-                if not re.search(r'[A-Z]', password):
-                    return False
-                if not re.search(r'[0-9]', password):
-                    return False
-                if not re.search(r'[!-\/:-@[-`{-~]', password):
-                    return False
-                return True
+                errors = {'is_valid': True,
+                  'short': False,
+                  'no_lowercase': False,
+                  'no_uppercase': False,
+                  'no_num': False,
+                  'no_special': False}
+                if len(password) < 8: # Password should be at least 8 chars
+                    errors['is_valid'] = False
+                    errors['short'] = True
+                if not re.search(r'[a-z]', password): # Password should have at least one lowercase char
+                    errors['is_valid'] = False
+                    errors['no_lowercase'] = True
+                if not re.search(r'[A-Z]', password): # Password should have at least one uppercase char
+                    errors['is_valid'] = False
+                    errors['no_uppercase'] = True
+                if not re.search(r'[0-9]', password): # Password should have at least one number
+                    errors['is_valid'] = False
+                    errors['no_num'] = True
+                if not re.search(r'[!-\/:-@[-`{-~]', password): # Password should have at least one special char
+                    errors['is_valid'] = False
+                    errors['no_special'] = True
+                return errors
         """
 
         self.db_path = db_path
@@ -116,7 +130,11 @@ class AccountManager():
         print("Credentials saved.")
 
 
-
+    #TODO: user_login: locked, locked_expiration_time, password_reset_token, password_reset_token_expiration_time, last_password_change, user_status, last_ip, recovery_email, account_type
+    #TODO: security_questions: uid, question/answer 1, 2, 3
+    #TODO: audit_log: uid, action, timestamp
+    #TODO: user_ips: uid, ip_address, timestamp
+    #TODO: user_sessions: uid, session_token, ip_address, user_agent, created_at, last_activity
     def open_connection(self):
         """
         Opens the SQL connection.
@@ -137,21 +155,25 @@ class AccountManager():
             validation_token: Unique token for validating the account email
             validation_token_expiration_time: Time when the validation token will expire
             two_factor_enabled: 1 if two-factor authentication is enabled; 0 otherwise
+            two_factor_secret: Secret code for two-factor authentication
             last_password_change: Time of last password change
+            user_status: Status of the user (i.e. 'active', 'suspended', 'banned', etc.)
+            last_ip: Last IP that the user logged in from
+            recovery_email: Recovery email address
+            account_type: Type of account (i.e. 'user', 'admin', 'developer', etc.)
+        
+        SQL security_questions Table Fields: Stores security questions and answers
+            uid: User's unique id
             security_question_1: Security question 1
             security_answer_1: Hashed answer to security question 1
             security_question_2: Security question 2
             security_answer_2: Hashed answer to security question 2
             security_question_3: Security question 3
             security_answer_3: Hashed answer to security question 3
-            user_status: Status of the user (i.e. 'active', 'suspended', 'banned', etc.)
-            last_ip: Last IP that the user logged in from
-            recovery_email: Recovery email address
-            account_type: Type of account (i.e. 'user', 'admin', 'developer', etc.)
 
         SQL audit_log Table Fields: Stores all attempts at logging in
             id: Entry id
-            uid: user's unique id
+            uid: User's unique id
             action: Action taken (i.e. 'Successful Login', 'Failed Login', etc.)
             timestamp: Time of action
 
@@ -173,9 +195,11 @@ class AccountManager():
 
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
+        
+        # user_login
         self.cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_login (
-            uid INTEGER PRIMARY KEY UNIQUE,
+            uid TEXT PRIMARY KEY UNIQUE,
             email TEXT UNIQUE,
             email_validated INTEGER DEFAULT 0,
             username TEXT UNIQUE,
@@ -190,42 +214,56 @@ class AccountManager():
             validation_token TEXT,
             validation_token_expiration_time INTEGER DEFAULT 0,
             two_factor_enabled INTEGER DEFAULT 0,
+            two_factor_secret TEXT,
             last_password_change INTEGER,
+            user_status TEXT DEFAULT 'active',
+            last_ip TEXT,
+            recovery_email TEXT,
+            account_type TEXT DEFAULT 'user'
+        )
+        ''')
+        
+        # security_questions
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS security_questions (
+            uid TEXT PRIMARY KEY,
             security_question_1 TEXT,
             security_answer_1 TEXT,
             security_question_2 TEXT,
             security_answer_2 TEXT,
             security_question_3 TEXT,
             security_answer_3 TEXT,
-            user_status TEXT DEFAULT 'active',
-            last_ip TEXT,
-            recovery_email TEXT,
-            account_type TEXT DEFAULT 'user',
-            notification_preferences TEXT
+            FOREIGN KEY(uid) REFERENCES user_login(uid)
         )
         ''')
+        
+        # audit_log
         self.cursor.execute('''
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid INTEGER,
+            uid TEXT,
             action TEXT,
             timestamp INTEGER DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(uid) REFERENCES user_login(uid)
         )
         ''')
+        
+        # user_ips
         self.cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_ips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid INTEGER,
+            uid TEXT,
             ip_address TEXT,
             timestamp INTEGER DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(uid) REFERENCES user_login(uid)
         )
         ''')
+        
+        # user_sessions
         self.cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_sessions (
             session_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid INTEGER,
+            uid TEXT,
             session_token TEXT UNIQUE,
             ip_address TEXT,
             user_agent TEXT,
@@ -234,6 +272,7 @@ class AccountManager():
             FOREIGN KEY(uid) REFERENCES user_login(uid)
         );
         ''')
+        
         self.conn.commit()
 
 
@@ -245,6 +284,25 @@ class AccountManager():
 
         self.conn.close()
 
+
+
+    def generate_unique_uid(self):
+        """
+        Generates a unique user id
+
+        Returns:
+            string: The unique user id
+        """
+        uid = None
+        while True:
+            uid = str(uuid.uuid4())
+            self.cursor.execute('''
+            SELECT COUNT(*) FROM user_login WHERE validation_token = ?
+            ''', (uid, ))
+            count = self.cursor.fetchone()[0]
+            if count == 0:
+                break # Only break if no other user has the same token
+        return uid
 
 
 
@@ -322,6 +380,38 @@ class AccountManager():
 
 
 
+    def login(self, username, password):
+        self.cursor.execute('''
+        SELECT uid FROM user_login WHERE username = ?
+        ''', (username,))
+        uid = self.cursor.fetchone()[0]
+        if not uid:
+            return False
+        if self.check_password(username, password):
+            return
+            # Set last_login time
+            self.cursor.execute('''
+            UPDATE user_login
+            SET last_login = >
+            WHERE username = ?
+            ''', (int(time.time()), username,))
+            self.conn.commit()
+        else:
+            # Enter into audit_log
+            self.cursor.execute('''
+            INSERT INTO audit_log (uid, action, timestamp) VALUES (?, ?, ?)
+            ''', (uid, "Incorrect Password", int(time.time())))
+            
+            # Update failed_login_attempts
+            self.cursor.execute('''
+            UPDATE user_login
+            SET failed_login_attempts = failed_login_attempts + 1
+            WHERE username = ?
+            ''', (username,))
+            self.conn.commit()
+
+
+
     def check_password(self, username, password):
         """
         Checks if a password is correct for a given username
@@ -371,11 +461,12 @@ class AccountManager():
         
         # Create a unique token for validating the email address
         validation_token, validation_token_expiration_time = self.get_unique_token()
+        uid = self.generate_unique_uid()
 
         # Add the user to the database
         self.cursor.execute('''
-        INSERT INTO user_login (email, username, password, validation_token, validation_token_expiration_time) VALUES (?, ?, ?, ?, ?)
-        ''', (email, username, self.hash_password(password), validation_token, validation_token_expiration_time))
+        INSERT INTO user_login (uid, email, username, password, validation_token, validation_token_expiration_time, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (uid, email, username, self.hash_password(password), validation_token, validation_token_expiration_time, int(time.time())))
         self.conn.commit()
 
         # Send the validation email
@@ -551,28 +642,45 @@ class AccountManager():
             return True
         except Exception as e:
             return False
+
+    def generate_2fa_secret(self, uid):
+        secret = pyotp.random_base32()
+        self.cursor.execute('''
+        UPDATE user_login
+        SET two_factor_secret = ?
+        WHERE uid = ?
+        ''', (secret, uid))
+        self.conn.commit()
+        return secret
     
-    #FIXME: Not sending text
-    def send_two_factor_text(self):
-        return
-        # Email settings
-        load_dotenv()
+    def get_2fa_qr_code(self, email, secret):
+        totp = pyotp.TOTP(secret)
+        uri = totp.provisioning_uri(name=email, issuer_name="App")
+        qr = qrcode.make(uri)
+        qr.save(f"{email}_2fa.png")
+        
+    def validate_otp(self, uid, otp):
+        self.cursor.execute('''
+        SELECT two_factor_secret FROM user_login WHERE uid = ?
+        ''', (uid,))
+        secret = self.cursor.fetchone()[0]
+        if not secret:
+            raise ValueError("2FA not enabled for this user.")
+        
+        totp = pyotp.TOTP(secret)
+        return totp.verify(otp)
+    
+    def enable_2fa(self, uid):
+        secret = self.generate_2fa_secret(uid)
+        return secret
+    
+    def disable_2fa(self, uid):
+        self.cursor.execute('''
+        UPDATE user_login SET two_factor_enabled = 0 two_factor_secret = NULL WHERE uid = ?
+        ''', (uid,))
+        self.conn.commit()
 
-        from_email = os.getenv('EMAIL_ADDRESS')
-        password = os.getenv('EMAIL_PASSWORD')
-        to_email = "6016189373@txt.att.net"  # E.g., 1234567890@vtext.com
-        subject = "Test SMS"
-        body = "Hello, this is a test SMS sent from Python!"
+manager = AccountManager()
+#manager.insert_user("BobbyMcGee@gmail.com", "BobbyMcGee", "BobbyMcGee#1")
+#manager.login("BobbyMcGee", "BobbyMcGee#2")
 
-        # Set up the server
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-        server.login(from_email, password)
-
-        # Create the email
-        message = f"Subject: {subject}\n\n{body}"
-
-        # Send the email
-        server.sendmail(from_email, to_email, message)
-        server.quit()
-
-        print("SMS sent!")
